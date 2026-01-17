@@ -26,6 +26,8 @@
 </p>
 
 ---
+## Disclaimer
+This application is an independent implementation created by **[@ZalexDev](https://github.com/zalexdev)** in his own capacity. The original KU Leuven researchers discovered and disclosed the vulnerability but have not released any code and are not affiliated with this project. Their inclusion in credits is solely to acknowledge their research contribution.
 
 ## Overview
 
@@ -198,7 +200,8 @@ WhisperPair/
 
 ### App Developer
 
-This application is an independent implementation created by **[@ZalexDev](https://github.com/zalexdev)** in his own capacity. The original KU Leuven researchers discovered and disclosed the vulnerability but have not released any code and are not affiliated with this project. Their inclusion in credits is solely to acknowledge their research contribution.
+**[@ZalexDev](https://github.com/zalexdev)**
+
 ### Original Research Team
 **KU Leuven, Belgium**
 
