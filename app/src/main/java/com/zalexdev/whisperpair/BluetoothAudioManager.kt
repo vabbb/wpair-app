@@ -163,26 +163,45 @@ class BluetoothAudioManager(private val context: Context) {
                 return
             }
 
-            val connectMethod = BluetoothHeadset::class.java.getMethod("connect", BluetoothDevice::class.java)
-            val result = connectMethod.invoke(headset, device) as Boolean
+            // Try programmatic connection - this requires MODIFY_PHONE_STATE on some devices
+            // which is a system permission. If it fails, we guide user to manual connection.
+            try {
+                val connectMethod = BluetoothHeadset::class.java.getMethod("connect", BluetoothDevice::class.java)
+                val result = connectMethod.invoke(headset, device) as Boolean
 
-            if (result) {
-                Log.d(TAG, "HFP connection initiated")
-                registerScoReceiver()
+                if (result) {
+                    Log.d(TAG, "HFP connection initiated")
+                    registerScoReceiver()
 
-                handler.postDelayed({
-                    try {
-                        if (headset.connectedDevices.contains(device)) {
-                            onStateChange(AudioState.Connected)
-                        } else {
-                            onStateChange(AudioState.Error("HFP connection timeout"))
+                    handler.postDelayed({
+                        try {
+                            if (headset.connectedDevices.contains(device)) {
+                                onStateChange(AudioState.Connected)
+                            } else {
+                                onStateChange(AudioState.Error("HFP_TIMEOUT"))
+                            }
+                        } catch (e: Exception) {
+                            onStateChange(AudioState.Error("Connection check failed"))
                         }
-                    } catch (e: Exception) {
-                        onStateChange(AudioState.Error("Connection check failed"))
-                    }
-                }, 5000)
-            } else {
-                onStateChange(AudioState.Error("Failed to initiate HFP connection"))
+                    }, 5000)
+                } else {
+                    onStateChange(AudioState.Error("HFP_MANUAL_REQUIRED"))
+                }
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                // The underlying cause is usually SecurityException for MODIFY_PHONE_STATE
+                val cause = e.cause
+                Log.w(TAG, "Programmatic HFP connect not available: ${cause?.message}")
+                if (cause is SecurityException && cause.message?.contains("MODIFY_PHONE_STATE") == true) {
+                    onStateChange(AudioState.Error("HFP_PERMISSION_DENIED"))
+                } else {
+                    onStateChange(AudioState.Error("HFP_MANUAL_REQUIRED"))
+                }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "HFP connect permission denied: ${e.message}")
+                onStateChange(AudioState.Error("HFP_PERMISSION_DENIED"))
+            } catch (e: NoSuchMethodException) {
+                Log.w(TAG, "HFP connect method not found")
+                onStateChange(AudioState.Error("HFP_MANUAL_REQUIRED"))
             }
 
         } catch (e: Exception) {

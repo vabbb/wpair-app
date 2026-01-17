@@ -8,10 +8,11 @@ data class FastPairDevice(
     val modelId: String? = null,
     val rssi: Int = -100,
     val lastSeen: Long = System.currentTimeMillis(),
-    var status: DeviceStatus = DeviceStatus.NOT_TESTED
+    var status: DeviceStatus = DeviceStatus.NOT_TESTED,
+    val isFastPair: Boolean = true
 ) {
     val displayName: String
-        get() = name ?: KnownDevices.getDeviceName(modelId) ?: "Unknown Fast Pair Device"
+        get() = name ?: KnownDevices.getDeviceName(modelId) ?: if (isFastPair) "Unknown Fast Pair Device" else "BLE Device"
 
     val manufacturer: String?
         get() = KnownDevices.getManufacturer(modelId)

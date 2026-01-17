@@ -19,6 +19,7 @@ class Scanner(
     }
 
     private var isScanning = false
+    private var scanAllDevices = false
     private val scanner = bluetoothAdapter?.bluetoothLeScanner
 
     private val scanCallback = object : ScanCallback() {
@@ -40,22 +41,39 @@ class Scanner(
     private fun processScanResult(result: ScanResult) {
         val device = result.device
         val scanRecord = result.scanRecord ?: return
-        val serviceData = scanRecord.getServiceData(FAST_PAIR_SERVICE_UUID) ?: return
 
-        val fastPairDevice = parseFastPairAdvertisement(
-            name = device.name,
-            address = device.address,
-            data = serviceData,
-            rssi = result.rssi
-        )
-        onDeviceFound(fastPairDevice)
+        val serviceData = scanRecord.getServiceData(FAST_PAIR_SERVICE_UUID)
+
+        if (serviceData != null) {
+            val fastPairDevice = parseFastPairAdvertisement(
+                name = device.name,
+                address = device.address,
+                data = serviceData,
+                rssi = result.rssi,
+                isFastPair = true
+            )
+            onDeviceFound(fastPairDevice)
+        } else if (scanAllDevices) {
+            val genericDevice = FastPairDevice(
+                name = device.name,
+                address = device.address,
+                isPairingMode = false,
+                hasAccountKeyFilter = false,
+                modelId = null,
+                rssi = result.rssi,
+                lastSeen = System.currentTimeMillis(),
+                isFastPair = false
+            )
+            onDeviceFound(genericDevice)
+        }
     }
 
     private fun parseFastPairAdvertisement(
         name: String?,
         address: String,
         data: ByteArray,
-        rssi: Int
+        rssi: Int,
+        isFastPair: Boolean = true
     ): FastPairDevice {
         var modelId: String? = null
         var isPairingMode = false
@@ -97,25 +115,33 @@ class Scanner(
             hasAccountKeyFilter = hasAccountKeyFilter,
             modelId = modelId,
             rssi = rssi,
-            lastSeen = System.currentTimeMillis()
+            lastSeen = System.currentTimeMillis(),
+            isFastPair = isFastPair
         )
     }
 
+    fun setScanAllDevices(scanAll: Boolean) {
+        scanAllDevices = scanAll
+    }
+
     @SuppressLint("MissingPermission")
-    fun startScanning(): Boolean {
+    fun startScanning(scanAll: Boolean = false): Boolean {
         if (scanner == null) {
             Log.e(TAG, "BluetoothLeScanner is null - Bluetooth may be disabled")
             return false
         }
 
+        // If already scanning with different filter, restart with new settings
         if (isScanning) {
-            Log.d(TAG, "Already scanning")
-            return true
+            if (scanAllDevices == scanAll) {
+                Log.d(TAG, "Already scanning with same filter")
+                return true
+            }
+            Log.d(TAG, "Restarting scan with new filter (scanAll=$scanAll)")
+            stopScanning()
         }
 
-        val filter = ScanFilter.Builder()
-            .setServiceData(FAST_PAIR_SERVICE_UUID, byteArrayOf())
-            .build()
+        scanAllDevices = scanAll
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -123,9 +149,17 @@ class Scanner(
             .build()
 
         return try {
-            scanner.startScan(listOf(filter), settings, scanCallback)
+            if (scanAll) {
+                scanner.startScan(null, settings, scanCallback)
+                Log.d(TAG, "Scanning ALL BLE devices")
+            } else {
+                val filter = ScanFilter.Builder()
+                    .setServiceData(FAST_PAIR_SERVICE_UUID, byteArrayOf())
+                    .build()
+                scanner.startScan(listOf(filter), settings, scanCallback)
+                Log.d(TAG, "Scanning Fast Pair devices only")
+            }
             isScanning = true
-            Log.d(TAG, "Scanning started")
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start scan", e)
